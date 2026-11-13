@@ -10,7 +10,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outbound"
 )
 
-func TestHeySocksURLTestMeasuresEndpointConnection(t *testing.T) {
+func TestHeySocksConnectionLatencyProbeDoesNotChangeHealthState(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -43,15 +43,22 @@ func TestHeySocksURLTestMeasuresEndpointConnection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	delay, err := proxy.URLTest(ctx, "not-an-url", nil)
+	previousDelay := proxy.LastDelayForTestUrl("not-an-url")
+	delay, supported, err := proxy.TestConnectionLatency(ctx)
 	if err != nil {
-		t.Fatalf("URLTest() error = %v", err)
+		t.Fatalf("TestConnectionLatency() error = %v", err)
+	}
+	if !supported {
+		t.Fatal("TestConnectionLatency() is not supported by HeySocks")
 	}
 	if delay == 0 || delay >= 1000 {
-		t.Fatalf("URLTest() delay = %d ms, want a positive endpoint connect time", delay)
+		t.Fatalf("TestConnectionLatency() delay = %d ms, want a positive endpoint connect time", delay)
 	}
-	if got := proxy.LastDelayForTestUrl("not-an-url"); got != delay {
-		t.Fatalf("LastDelayForTestUrl() = %d, want %d", got, delay)
+	if got := proxy.LastDelayForTestUrl("not-an-url"); got != previousDelay {
+		t.Fatalf("probe changed URLTest delay from %d to %d", previousDelay, got)
+	}
+	if !proxy.AliveForTestUrl("not-an-url") {
+		t.Fatal("connection latency probe changed the URLTest health state")
 	}
 	select {
 	case err := <-accepted:
@@ -63,7 +70,7 @@ func TestHeySocksURLTestMeasuresEndpointConnection(t *testing.T) {
 	}
 }
 
-func TestHeySocksURLTestUsesCatalogProbeEndpoint(t *testing.T) {
+func TestHeySocksHealthCheckDoesNotUseCatalogProbeEndpoint(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -97,12 +104,20 @@ func TestHeySocksURLTestUsesCatalogProbeEndpoint(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	delay, err := proxy.URLTest(ctx, "not-an-url", nil)
-	if err != nil {
-		t.Fatalf("URLTest() error = %v", err)
+	if _, err := proxy.URLTest(ctx, "not-an-url", nil); err == nil {
+		t.Fatal("URLTest() unexpectedly passed without a valid test URL or working transport")
 	}
-	if delay == 0 || delay >= 1000 {
-		t.Fatalf("URLTest() delay = %d ms, want a positive probe endpoint connect time", delay)
+	if proxy.AliveForTestUrl("not-an-url") {
+		t.Fatal("failed URLTest() marked the proxy healthy")
+	}
+	select {
+	case err := <-accepted:
+		t.Fatalf("health check connected to the catalog-only probe endpoint: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if _, supported, err := proxy.TestConnectionLatency(ctx); err != nil || !supported {
+		t.Fatalf("catalog latency probe supported=%t error=%v", supported, err)
 	}
 	select {
 	case err := <-accepted:

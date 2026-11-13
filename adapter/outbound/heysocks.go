@@ -103,79 +103,19 @@ func (h *HeySocks) TestConnectionLatency(ctx context.Context) (uint16, error) {
 	if len(endpoints) == 0 {
 		endpoints = []string{h.addr}
 	}
-	targets, err := resolveHeySocksProbeEndpoints(ctx, endpoints, h.option.ProbeEndpointFallbackResolver)
-	if err != nil {
-		return 0, err
-	}
-	if h.prefer == C.IPv4Only || h.prefer == C.IPv6Only {
-		filtered := targets[:0]
-		for _, target := range targets {
-			if (h.prefer == C.IPv4Only && target.ip.Is4()) || (h.prefer == C.IPv6Only && target.ip.Is6()) {
-				filtered = append(filtered, target)
-			}
-		}
-		targets = filtered
-	}
-	if len(targets) == 0 {
-		return 0, resolver.ErrIPNotFound
-	}
-
-	probeCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	delays := make(chan uint16, len(targets))
-	var firstErr error
-	var firstErrOnce sync.Once
-	var wait sync.WaitGroup
-	for _, target := range targets {
-		wait.Add(1)
-		go func(target heySocksProbeTarget) {
-			defer wait.Done()
-			started := time.Now()
-			conn, err := h.dialer.DialContext(
-				probeCtx,
-				"tcp",
-				net.JoinHostPort(target.ip.String(), strconv.Itoa(int(target.port))),
-			)
-			if err != nil {
-				firstErrOnce.Do(func() { firstErr = err })
-				return
-			}
-			delay := uint16(time.Since(started) / time.Millisecond)
-			_ = conn.Close()
-			if delay == 0 {
-				delay = 1
-			}
-			delays <- delay
-			cancel()
-		}(target)
-	}
-	wait.Wait()
-	close(delays)
-
-	var fastest uint16
-	for delay := range delays {
-		if fastest == 0 || delay < fastest {
-			fastest = delay
-		}
-	}
-	if fastest == 0 {
-		return 0, firstErr
-	}
-	return fastest, nil
+	return probeHeySocksEndpoints(ctx, endpoints, h.option.ProbeEndpointFallbackResolver,
+		h.prefer, h.dialer.DialContext, resolveHeySocksEndpoint)
 }
 
-type heySocksProbeTarget struct {
-	ip   netip.Addr
-	port uint16
-}
-
-func resolveHeySocksProbeEndpoints(ctx context.Context, endpoints []string, fallback map[string]string) ([]heySocksProbeTarget, error) {
-	type probeEndpoint struct {
-		host string
-		port uint16
-	}
-	parsed := make([]probeEndpoint, 0, len(endpoints))
-	hosts := make(map[string]bool, len(endpoints))
+func probeHeySocksEndpoints(
+	ctx context.Context,
+	endpoints []string,
+	fallback map[string]string,
+	prefer C.DNSPrefer,
+	dial func(context.Context, string, string) (net.Conn, error),
+	resolve func(context.Context, string) ([]netip.Addr, error),
+) (uint16, error) {
+	portsByHost := make(map[string]map[uint16]bool, len(endpoints))
 	var firstErr error
 	for _, rawEndpoint := range endpoints {
 		host, portText, err := net.SplitHostPort(strings.TrimSpace(rawEndpoint))
@@ -192,66 +132,104 @@ func resolveHeySocksProbeEndpoints(ctx context.Context, endpoints []string, fall
 			}
 			continue
 		}
-		parsed = append(parsed, probeEndpoint{host: host, port: uint16(port)})
-		hosts[host] = true
+		if portsByHost[host] == nil {
+			portsByHost[host] = make(map[uint16]bool)
+		}
+		portsByHost[host][uint16(port)] = true
+	}
+	if len(portsByHost) == 0 {
+		if firstErr == nil {
+			firstErr = resolver.ErrIPNotFound
+		}
+		return 0, firstErr
 	}
 
-	type resolution struct {
-		ips []netip.Addr
-		err error
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	dnsTimeout := time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, ctx.Err()
+		}
+		if remaining/3 < dnsTimeout {
+			dnsTimeout = remaining / 3
+		}
 	}
-	resolved := make(map[string]resolution, len(hosts))
-	var resolveWait sync.WaitGroup
-	var resolveMu sync.Mutex
-	for host := range hosts {
-		resolveWait.Add(1)
-		go func(host string) {
-			defer resolveWait.Done()
-			ips, err := resolveHeySocksEndpoint(ctx, host)
+	dnsCtx, cancelDNS := context.WithTimeout(probeCtx, dnsTimeout)
+	defer cancelDNS()
+
+	delays := make(chan uint16, 1)
+	var firstErrOnce sync.Once
+	var wait sync.WaitGroup
+	for host, ports := range portsByHost {
+		wait.Add(1)
+		go func(host string, ports map[uint16]bool) {
+			defer wait.Done()
+			ips, err := resolve(dnsCtx, host)
 			if err != nil || len(ips) == 0 {
 				fallbackIPs := fallback[host]
 				if fallbackIPs == "" {
 					fallbackIPs = fallback[strings.ToLower(host)]
 				}
 				ips = parseHeySocksFallbackIPs(fallbackIPs)
-				if len(ips) > 0 {
-					err = nil
-				} else if err == nil {
-					err = resolver.ErrIPNotFound
+				if len(ips) == 0 {
+					if err == nil {
+						err = resolver.ErrIPNotFound
+					}
+					firstErrOnce.Do(func() { firstErr = err })
+					return
 				}
 			}
-			resolveMu.Lock()
-			resolved[host] = resolution{ips: ips, err: err}
-			resolveMu.Unlock()
-		}(host)
-	}
-	resolveWait.Wait()
-
-	seen := map[heySocksProbeTarget]bool{}
-	targets := make([]heySocksProbeTarget, 0, len(parsed))
-	for _, endpoint := range parsed {
-		result := resolved[endpoint.host]
-		if len(result.ips) == 0 {
-			if firstErr == nil {
-				firstErr = result.err
+			var targetWait sync.WaitGroup
+			for _, rawIP := range ips {
+				ip := rawIP.Unmap()
+				if (prefer == C.IPv4Only && !ip.Is4()) || (prefer == C.IPv6Only && !ip.Is6()) {
+					continue
+				}
+				for port := range ports {
+					targetWait.Add(1)
+					go func(ip netip.Addr, port uint16) {
+						defer targetWait.Done()
+						started := time.Now()
+						conn, dialErr := dial(
+							probeCtx,
+							"tcp",
+							net.JoinHostPort(ip.String(), strconv.Itoa(int(port))),
+						)
+						if dialErr != nil {
+							firstErrOnce.Do(func() { firstErr = dialErr })
+							return
+						}
+						delay := uint16(time.Since(started) / time.Millisecond)
+						_ = conn.Close()
+						if delay == 0 {
+							delay = 1
+						}
+						select {
+						case delays <- delay:
+							cancel()
+						case <-probeCtx.Done():
+						}
+					}(ip, port)
+				}
 			}
-			continue
-		}
-		for _, ip := range result.ips {
-			target := heySocksProbeTarget{ip: ip.Unmap(), port: endpoint.port}
-			if !seen[target] {
-				seen[target] = true
-				targets = append(targets, target)
-			}
-		}
+			targetWait.Wait()
+		}(host, ports)
 	}
-	if len(targets) == 0 {
-		if firstErr == nil {
-			firstErr = resolver.ErrIPNotFound
-		}
-		return nil, firstErr
+	wait.Wait()
+	select {
+	case delay := <-delays:
+		return delay, nil
+	default:
 	}
-	return targets, nil
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if firstErr == nil {
+		firstErr = resolver.ErrIPNotFound
+	}
+	return 0, firstErr
 }
 
 func parseHeySocksFallbackIPs(value string) []netip.Addr {

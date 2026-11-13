@@ -88,6 +88,19 @@ func (p *Proxy) DelayHistoryForTestUrl(url string) []C.DelayHistory {
 	return histories
 }
 
+// TestConnectionLatency is the catalog-port probe used by the manual node list.
+// It deliberately does not update URLTest health state or delay history.
+func (p *Proxy) TestConnectionLatency(ctx context.Context) (uint16, bool, error) {
+	tester, ok := p.ProxyAdapter.(interface {
+		TestConnectionLatency(context.Context) (uint16, error)
+	})
+	if !ok {
+		return 0, false, nil
+	}
+	delay, err := tester.TestConnectionLatency(ctx)
+	return delay, true, err
+}
+
 // ExtraDelayHistories return all delay histories for each test URL
 // implements C.Proxy
 func (p *Proxy) ExtraDelayHistories() map[string]C.ProxyState {
@@ -202,15 +215,6 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 		}
 
 	}()
-
-	// HeySocks latency is the connection time to the node endpoint, not to a test URL.
-	if tester, ok := p.ProxyAdapter.(interface {
-		TestConnectionLatency(context.Context) (uint16, error)
-	}); ok {
-		t, err = tester.TestConnectionLatency(ctx)
-		satisfied = err == nil
-		return
-	}
 
 	unifiedDelay := UnifiedDelay.Load()
 

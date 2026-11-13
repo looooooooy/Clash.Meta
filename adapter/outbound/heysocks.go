@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
+	"sync"
+	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/heysocks"
 	"github.com/metacubex/mihomo/transport/socks5"
@@ -89,6 +93,82 @@ func (h *HeySocks) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.C
 		return nil, err
 	}
 	return NewConn(conn, h), nil
+}
+
+func (h *HeySocks) TestConnectionLatency(ctx context.Context) (uint16, error) {
+	host, port, err := net.SplitHostPort(h.addr)
+	if err != nil {
+		return 0, err
+	}
+	ips, err := resolveHeySocksEndpoint(ctx, host)
+	if err != nil {
+		return 0, err
+	}
+	if h.prefer == C.IPv4Only || h.prefer == C.IPv6Only {
+		filtered := make([]netip.Addr, 0, len(ips))
+		for _, ip := range ips {
+			if (h.prefer == C.IPv4Only && ip.Is4()) || (h.prefer == C.IPv6Only && ip.Is6()) {
+				filtered = append(filtered, ip)
+			}
+		}
+		ips = filtered
+	}
+	if len(ips) == 0 {
+		return 0, resolver.ErrIPNotFound
+	}
+
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	delays := make(chan uint16, len(ips))
+	var firstErr error
+	var firstErrOnce sync.Once
+	var wait sync.WaitGroup
+	for _, ip := range ips {
+		wait.Add(1)
+		go func(ip netip.Addr) {
+			defer wait.Done()
+			started := time.Now()
+			conn, err := h.dialer.DialContext(
+				probeCtx,
+				"tcp",
+				net.JoinHostPort(ip.String(), port),
+			)
+			if err != nil {
+				firstErrOnce.Do(func() { firstErr = err })
+				return
+			}
+			delay := uint16(time.Since(started) / time.Millisecond)
+			_ = conn.Close()
+			if delay == 0 {
+				delay = 1
+			}
+			delays <- delay
+			cancel()
+		}(ip)
+	}
+	wait.Wait()
+	close(delays)
+
+	var fastest uint16
+	for delay := range delays {
+		if fastest == 0 || delay < fastest {
+			fastest = delay
+		}
+	}
+	if fastest == 0 {
+		return 0, firstErr
+	}
+	return fastest, nil
+}
+
+func resolveHeySocksEndpoint(ctx context.Context, host string) ([]netip.Addr, error) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+	if systemResolver := resolver.SystemResolver; systemResolver != nil {
+		return resolver.LookupIPWithResolver(ctx, host, systemResolver)
+	}
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
 func (h *HeySocks) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {

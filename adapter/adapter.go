@@ -203,6 +203,15 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 	}()
 
+	// HeySocks latency is the connection time to the node endpoint, not to a test URL.
+	if tester, ok := p.ProxyAdapter.(interface {
+		TestConnectionLatency(context.Context) (uint16, error)
+	}); ok {
+		t, err = tester.TestConnectionLatency(ctx)
+		satisfied = err == nil
+		return
+	}
+
 	unifiedDelay := UnifiedDelay.Load()
 
 	addr, err := urlToMetadata(url)

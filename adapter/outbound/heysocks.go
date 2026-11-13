@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,15 +21,17 @@ import (
 
 type HeySocksOption struct {
 	BasicOption
-	Name              string            `proxy:"name"`
-	Server            string            `proxy:"server"`
-	Port              int               `proxy:"port"`
-	Password          string            `proxy:"password"`
-	Cipher            string            `proxy:"cipher"`
-	FakeNet           map[string]string `proxy:"fake-net"`
-	UDP               bool              `proxy:"udp,omitempty"`
-	UDPOverTCP        bool              `proxy:"udp-over-tcp,omitempty"`
-	UDPOverTCPVersion int               `proxy:"udp-over-tcp-version,omitempty"`
+	Name                          string            `proxy:"name"`
+	Server                        string            `proxy:"server"`
+	Port                          int               `proxy:"port"`
+	Password                      string            `proxy:"password"`
+	Cipher                        string            `proxy:"cipher"`
+	FakeNet                       map[string]string `proxy:"fake-net"`
+	UDP                           bool              `proxy:"udp,omitempty"`
+	UDPOverTCP                    bool              `proxy:"udp-over-tcp,omitempty"`
+	UDPOverTCPVersion             int               `proxy:"udp-over-tcp-version,omitempty"`
+	ProbeEndpoints                []string          `proxy:"probe-endpoints,omitempty"`
+	ProbeEndpointFallbackResolver map[string]string `proxy:"probe-endpoint-fallback-resolver,omitempty"`
 }
 
 type HeySocks struct {
@@ -96,42 +99,42 @@ func (h *HeySocks) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.C
 }
 
 func (h *HeySocks) TestConnectionLatency(ctx context.Context) (uint16, error) {
-	host, port, err := net.SplitHostPort(h.addr)
-	if err != nil {
-		return 0, err
+	endpoints := h.option.ProbeEndpoints
+	if len(endpoints) == 0 {
+		endpoints = []string{h.addr}
 	}
-	ips, err := resolveHeySocksEndpoint(ctx, host)
+	targets, err := resolveHeySocksProbeEndpoints(ctx, endpoints, h.option.ProbeEndpointFallbackResolver)
 	if err != nil {
 		return 0, err
 	}
 	if h.prefer == C.IPv4Only || h.prefer == C.IPv6Only {
-		filtered := make([]netip.Addr, 0, len(ips))
-		for _, ip := range ips {
-			if (h.prefer == C.IPv4Only && ip.Is4()) || (h.prefer == C.IPv6Only && ip.Is6()) {
-				filtered = append(filtered, ip)
+		filtered := targets[:0]
+		for _, target := range targets {
+			if (h.prefer == C.IPv4Only && target.ip.Is4()) || (h.prefer == C.IPv6Only && target.ip.Is6()) {
+				filtered = append(filtered, target)
 			}
 		}
-		ips = filtered
+		targets = filtered
 	}
-	if len(ips) == 0 {
+	if len(targets) == 0 {
 		return 0, resolver.ErrIPNotFound
 	}
 
 	probeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	delays := make(chan uint16, len(ips))
+	delays := make(chan uint16, len(targets))
 	var firstErr error
 	var firstErrOnce sync.Once
 	var wait sync.WaitGroup
-	for _, ip := range ips {
+	for _, target := range targets {
 		wait.Add(1)
-		go func(ip netip.Addr) {
+		go func(target heySocksProbeTarget) {
 			defer wait.Done()
 			started := time.Now()
 			conn, err := h.dialer.DialContext(
 				probeCtx,
 				"tcp",
-				net.JoinHostPort(ip.String(), port),
+				net.JoinHostPort(target.ip.String(), strconv.Itoa(int(target.port))),
 			)
 			if err != nil {
 				firstErrOnce.Do(func() { firstErr = err })
@@ -144,7 +147,7 @@ func (h *HeySocks) TestConnectionLatency(ctx context.Context) (uint16, error) {
 			}
 			delays <- delay
 			cancel()
-		}(ip)
+		}(target)
 	}
 	wait.Wait()
 	close(delays)
@@ -159,6 +162,109 @@ func (h *HeySocks) TestConnectionLatency(ctx context.Context) (uint16, error) {
 		return 0, firstErr
 	}
 	return fastest, nil
+}
+
+type heySocksProbeTarget struct {
+	ip   netip.Addr
+	port uint16
+}
+
+func resolveHeySocksProbeEndpoints(ctx context.Context, endpoints []string, fallback map[string]string) ([]heySocksProbeTarget, error) {
+	type probeEndpoint struct {
+		host string
+		port uint16
+	}
+	parsed := make([]probeEndpoint, 0, len(endpoints))
+	hosts := make(map[string]bool, len(endpoints))
+	var firstErr error
+	for _, rawEndpoint := range endpoints {
+		host, portText, err := net.SplitHostPort(strings.TrimSpace(rawEndpoint))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil || port == 0 || host == "" {
+			if firstErr == nil {
+				firstErr = net.InvalidAddrError(rawEndpoint)
+			}
+			continue
+		}
+		parsed = append(parsed, probeEndpoint{host: host, port: uint16(port)})
+		hosts[host] = true
+	}
+
+	type resolution struct {
+		ips []netip.Addr
+		err error
+	}
+	resolved := make(map[string]resolution, len(hosts))
+	var resolveWait sync.WaitGroup
+	var resolveMu sync.Mutex
+	for host := range hosts {
+		resolveWait.Add(1)
+		go func(host string) {
+			defer resolveWait.Done()
+			ips, err := resolveHeySocksEndpoint(ctx, host)
+			if err != nil || len(ips) == 0 {
+				fallbackIPs := fallback[host]
+				if fallbackIPs == "" {
+					fallbackIPs = fallback[strings.ToLower(host)]
+				}
+				ips = parseHeySocksFallbackIPs(fallbackIPs)
+				if len(ips) > 0 {
+					err = nil
+				} else if err == nil {
+					err = resolver.ErrIPNotFound
+				}
+			}
+			resolveMu.Lock()
+			resolved[host] = resolution{ips: ips, err: err}
+			resolveMu.Unlock()
+		}(host)
+	}
+	resolveWait.Wait()
+
+	seen := map[heySocksProbeTarget]bool{}
+	targets := make([]heySocksProbeTarget, 0, len(parsed))
+	for _, endpoint := range parsed {
+		result := resolved[endpoint.host]
+		if len(result.ips) == 0 {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		for _, ip := range result.ips {
+			target := heySocksProbeTarget{ip: ip.Unmap(), port: endpoint.port}
+			if !seen[target] {
+				seen[target] = true
+				targets = append(targets, target)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		if firstErr == nil {
+			firstErr = resolver.ErrIPNotFound
+		}
+		return nil, firstErr
+	}
+	return targets, nil
+}
+
+func parseHeySocksFallbackIPs(value string) []netip.Addr {
+	ips := make([]netip.Addr, 0)
+	for _, candidate := range strings.Split(value, ",") {
+		candidate = strings.TrimSpace(candidate)
+		candidate = strings.TrimPrefix(strings.TrimSuffix(candidate, "]"), "[")
+		ip, err := netip.ParseAddr(candidate)
+		if err == nil {
+			ips = append(ips, ip.Unmap())
+		}
+	}
+	return ips
 }
 
 func resolveHeySocksEndpoint(ctx context.Context, host string) ([]netip.Addr, error) {
